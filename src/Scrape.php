@@ -2,66 +2,117 @@
 
 namespace App;
 
+use Symfony\Component\DomCrawler\Crawler;
+use Symfony\Component\DomCrawler\UriResolver;
+
 require 'vendor/autoload.php';
 
 class Scrape
 {
     private array $products = [];
 
+    const MB_IN_GB = 1000;
+
+    const PRODUCTS_URL = 'https://www.magpiehq.com/developer-challenge/smartphones/';
+
     public function run(): void
     {
-        
-        for($i = 1; $i < 3;  $i++){
-            $document = ScrapeHelper::fetchDocument('https://www.magpiehq.com/developer-challenge/smartphones/?page='.$i);
+        $document = ScrapeHelper::fetchDocument(self::PRODUCTS_URL);
 
-            $product = [];
+        $pages = $document->filter('#pages')->filter('a');
+        $products = $document->filter('.product');
+        $pageCount = count($pages);
+        $this->getProducts($products);
 
-            $fetchProduct = $document->filter('.product-name, .product-capacity, .bg-white .text-lg, .product img, .px-2 span,.bg-white .text-sm')->extract(['_name', '_text', 'class','src', 'data-colour']);
-    
-            foreach($fetchProduct as $domElement){
-
-                if($domElement[0] == "img"){
-                    $product['imageUrl'] = $domElement[3];
-                }elseif($domElement[0] == "span"){
-
-                    if(!empty($domElement[4])){
-                        $product['color'] = $domElement[4];
-                    }
-
-                    if(!empty($domElement[1])){
-                        if(preg_match('/\d*[GBMB]/', trim($domElement[1]))){
-                            $product['capacity'] = preg_match('/\d*[MB]/', trim($domElement[1])) ? intval($domElement[1]) * 1000 : intval($domElement[1]);
-                        }else{
-                            $product['title'] = trim($domElement[1]);
-                        }
-                        
-                    }
-                }else{
-                    if(preg_match('/[£]\d+.?\d+/', trim($domElement[1]))){
-                        $product['price'] = trim($domElement[1]);
-                    }else{
-                        if(trim($domElement[1]) == "Availability: Out of Stock"){
-                            $product['availabilityText'] = trim($domElement[1]);
-                            $product['isAvailable'] = trim($domElement[1]) == "Availability: Out of Stock" ? "false" : "true";
-                        }else{
-                            $product['availabilityText'] = "Availability: In Stock";
-                            $product['isAvailable']      = "true";
-                            $product['shippingText']     = trim($domElement[1]);
-                            $product['shippingDate']     = date('Y-m-d');
-                        }
-                    }
-                }
-
-                if(count($product) > 6){
-                array_push($this->products, $product );
-                }
-
-                    
-            }
+        for ($page = 2; $page <= $pageCount; $page++) {
+            $document = ScrapeHelper::fetchDocument(self::PRODUCTS_URL."?page=".$page);
+            $products = $document->filter('.product');
+            $this->getProducts($products);
         }
 
-        file_put_contents('output.json', json_encode($this->products));
+        file_put_contents('output.json', json_encode($this->products, JSON_UNESCAPED_SLASHES));
     }
+
+    /**
+     * @param Crawler $products
+     */
+    private function getProducts(Crawler $products): void
+    {
+        foreach ($products as $product) {
+            try {
+                $productCrawler = new Crawler($product);
+
+                // Get product colours as array
+                $colours = $productCrawler->filter('span[data-colour]')->each(function (Crawler $node, $i) {
+                    return $node->attr('data-colour');
+                });
+
+                // Get product name
+                $name = $productCrawler->filter('.product-name')->text();
+
+                // Get product capacity
+                $capacityText = $productCrawler->filter('.product-capacity')->text();
+                $capacityInt = (int)filter_var($capacityText, FILTER_SANITIZE_NUMBER_INT);
+
+                $title = $name." ".$capacityText;
+
+                // Convert capacity to MB if GB
+                if (strpos($capacityText, 'GB') !== false) {
+                    $capacityMB = $capacityInt * self::MB_IN_GB;
+                } else {
+                    $capacityMB = $capacityInt;
+                }
+
+                // Get product price
+                $priceText = $productCrawler->filterXPath("//div[contains(text(), '£')]")->text();
+                $priceFloat = (float) filter_var( $priceText, FILTER_SANITIZE_NUMBER_FLOAT, FILTER_FLAG_ALLOW_FRACTION);
+
+                // Get product image src and resolve to absolute url
+                $imageSrc = $productCrawler->filter('img')->attr('src');
+                $imageUrl = UriResolver::resolve($imageSrc, self::PRODUCTS_URL);
+
+                // Get product availability
+                $availabilityText = $productCrawler->filterXPath("//div[contains(text(), 'Availability:')]")->text();
+                $availabilityText = trim(substr($availabilityText,strrpos($availabilityText,':') + 1));
+                $isAvailable = $availabilityText == "Out of Stock" ? false : true;
+
+                // Get shipping text and date if exists
+                $shippingText = null;
+                $shippingDate = null;
+                $shippingTextNode = $productCrawler->filterXPath("//div[contains(translate(text(), 
+                                        'ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+                                        'abcdefghijklmnopqrstuvwxyz'), 'deliver')
+                                        or contains(translate(text(), 
+                                        'ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+                                        'abcdefghijklmnopqrstuvwxyz'), 'ship')]");
+                if ($shippingTextNode->count()) {
+                    $shippingText = $shippingTextNode->text();
+                    $shippingDate = ScrapeHelper::extractDateFromString($shippingText);
+                }
+
+                foreach ($colours as $colour) {
+                    $prod = new Product();
+                    $prod->setTitle($title);
+                    $prod->setPrice($priceFloat);
+                    $prod->setImageUrl($imageUrl);
+                    $prod->setCapacityMB($capacityMB);
+                    $prod->setColour($colour);
+                    $prod->setAvailabilityText($availabilityText);
+                    $prod->setIsAvailable($isAvailable);
+                    $prod->setShippingText($shippingText);
+                    $prod->setShippingDate($shippingDate);
+
+                    if (!in_array($prod,$this->products)) {
+                        $this->products[] = $prod;
+                    }
+                }
+
+            } catch (\Exception $e) {
+                echo $e->getMessage();
+            }
+        }
+    }
+
 }
 
 $scrape = new Scrape();
